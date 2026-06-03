@@ -1,0 +1,12 @@
+FROM scratch
+#FROM alpine
+
+WORKDIR /
+COPY dns-lb ./
+
+EXPOSE 9100
+EXPOSE 53
+
+#USER nonroot:nonroot
+
+ENTRYPOINT ["/dns-lb"]
