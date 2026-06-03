@@ -114,6 +114,8 @@ WantedBy=multi-user.target
 
 ## 📊 Monitoring & Grafana
 
+![Grafana dashboard](docs/grafana_dashboard_dns_lb.png)
+
 The proxy exposes a Prometheus endpoint on the configured port (`--metrics-port`). 
 
 A complete Grafana dashboard is available in the `/grafana` folder. It includes:
