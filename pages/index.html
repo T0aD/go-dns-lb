@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DNS-LB — High-Performance DNS Load Balancer Proxy</title>
+    <style>
+        :root {
+            --bg-primary: #0a0e1a;
+            --bg-secondary: #131824;
+            --bg-card: #1a1f2e;
+            --accent: #ff6b35;
+            --accent-2: #00d4ff;
+            --text: #e4e7eb;
+            --text-muted: #8b92a7;
+            --border: #2a3142;
+            --success: #4ade80;
+            --warning: #fbbf24;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        .container { max-width: 1200px; margin: 0 auto; padding: 0 2rem; }
+
+        /* HERO */
+        .hero {
+            min-height: 90vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            position: relative;
+            background: radial-gradient(ellipse at top, rgba(255, 107, 53, 0.1), transparent 60%),
+                        radial-gradient(ellipse at bottom, rgba(0, 212, 255, 0.08), transparent 60%);
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-image: 
+                linear-gradient(rgba(255, 107, 53, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 107, 53, 0.03) 1px, transparent 1px);
+            background-size: 50px 50px;
+            pointer-events: none;
+        }
+
+        .hero-content { position: relative; z-index: 1; }
+
+        .badge {
+            display: inline-block;
+            padding: 0.4rem 1rem;
+            background: rgba(255, 107, 53, 0.1);
+            border: 1px solid var(--accent);
+            border-radius: 20px;
+            font-size: 0.85rem;
+            color: var(--accent);
+            margin-bottom: 1.5rem;
+            font-weight: 500;
+        }
+
+        h1 {
+            font-size: clamp(2.5rem, 6vw, 4.5rem);
+            font-weight: 800;
+            margin-bottom: 1.5rem;
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.02em;
+        }
+
+        .tagline {
+            font-size: 1.3rem;
+            color: var(--text-muted);
+            max-width: 700px;
+            margin: 0 auto 2.5rem;
+        }
+
+        .cta-group {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 0.9rem 2rem;
+            border-radius: 8px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 1rem;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+        .btn-primary:hover {
+            background: #ff7d4d;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(255, 107, 53, 0.3);
+        }
+
+        .btn-secondary {
+            background: transparent;
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+        .btn-secondary:hover {
+            border-color: var(--accent-2);
+            color: var(--accent-2);
+        }
+
+        /* SECTIONS */
+        section { padding: 6rem 0; }
+
+        .section-title {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+            text-align: center;
+            font-weight: 700;
+        }
+
+        .section-subtitle {
+            text-align: center;
+            color: var(--text-muted);
+            margin-bottom: 4rem;
+            font-size: 1.1rem;
+        }
+
+        /* FEATURES */
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .feature-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 2rem;
+            transition: all 0.3s;
+        }
+
+        .feature-card:hover {
+            border-color: var(--accent);
+            transform: translateY(-4px);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+        }
+
+        .feature-icon {
+            font-size: 2rem;
+            margin-bottom: 1rem;
+            display: inline-block;
+        }
+
+        .feature-card h3 {
+            font-size: 1.2rem;
+            margin-bottom: 0.75rem;
+            color: var(--text);
+        }
+
+        .feature-card p {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+        }
+
+        /* PERFORMANCE */
+        .perf-section {
+            background: var(--bg-secondary);
+        }
+
+        .perf-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 2rem;
+            margin-top: 3rem;
+        }
+
+        .perf-card {
+            text-align: center;
+            padding: 2rem;
+            background: var(--bg-card);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }
+
+        .perf-value {
+            font-size: 3rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--accent), var(--accent-2));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+        }
+
+        .perf-label {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        /* SCREENSHOT */
+        .screenshot-wrapper {
+            margin-top: 3rem;
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid var(--border);
+            box-shadow: 0 30px 80px rgba(0, 0, 0, 0.5);
+            position: relative;
+        }
+
+        .screenshot-wrapper::before {
+            content: '● ● ●';
+            display: block;
+            padding: 0.75rem 1rem;
+            background: var(--bg-card);
+            color: var(--text-muted);
+            letter-spacing: 4px;
+            font-size: 0.8rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .screenshot-wrapper img {
+            width: 100%;
+            display: block;
+        }
+
+        /* QUICK START */
+        .code-block {
+            background: #0d1117;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin: 1.5rem 0;
+            overflow-x: auto;
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            font-size: 0.9rem;
+            position: relative;
+        }
+
+        .code-block::before {
+            content: 'bash';
+            position: absolute;
+            top: 0.5rem;
+            right: 1rem;
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            text-transform: uppercase;
+        }
+
+        .code-block code {
+            color: #e6edf3;
+            white-space: pre;
+        }
+
+        .code-block .comment { color: #8b949e; }
+        .code-block .cmd { color: #79c0ff; }
+        .code-block .flag { color: #ff7b72; }
+        .code-block .string { color: #a5d6ff; }
+
+        /* ARCHITECTURE */
+        .arch-diagram {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 3rem 2rem;
+            text-align: center;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            line-height: 2;
+            overflow-x: auto;
+        }
+
+        .arch-diagram .highlight {
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        .arch-diagram .highlight-2 {
+            color: var(--accent-2);
+            font-weight: 600;
+        }
+
+        /* FOOTER */
+        footer {
+            background: var(--bg-secondary);
+            padding: 3rem 0;
+            text-align: center;
+            border-top: 1px solid var(--border);
+        }
+
+        footer p {
+            color: var(--text-muted);
+            margin-bottom: 1rem;
+        }
+
+        footer a {
+            color: var(--accent-2);
+            text-decoration: none;
+        }
+
+        footer a:hover { text-decoration: underline; }
+
+        /* RESPONSIVE */
+        @media (max-width: 768px) {
+            .container { padding: 0 1.5rem; }
+            section { padding: 4rem 0; }
+            .perf-value { font-size: 2.2rem; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- HERO -->
+    <section class="hero">
+        <div class="hero-content">
+            <span class="badge">⚡ Open Source · Go · Production Ready</span>
+            <h1>DNS-LB</h1>
+            <p class="tagline">
+                A high-performance DNS load balancer proxy written in Go, featuring intelligent caching, 
+                Prometheus metrics, and systemd hardening — all in an 8 MB static binary.
+            </p>
+            <div class="cta-group">
+                <a href="#quickstart" class="btn btn-primary">🚀 Get Started</a>
+                <a href="https://github.com/T0aD/go-dns-lb" class="btn btn-secondary">⭐ GitHub</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- FEATURES -->
+    <section>
+        <div class="container">
+            <h2 class="section-title">Built for Production</h2>
+            <p class="section-subtitle">All the features of a professional DNS resolver, without the complexity.</p>
+
+            <div class="features-grid">
+                <div class="feature-card">
+                    <span class="feature-icon">🔄</span>
+                    <h3>Round-Robin Load Balancing</h3>
+                    <p>Even traffic distribution across multiple DNS backends with automatic failover on failure.</p>
+                </div>
+
+                <div class="feature-card">
+                    <span class="feature-icon">💾</span>
+                    <h3>Dual Cache (Positive/Negative)</h3>
+                    <p>Positive cache for NOERROR responses, negative cache for NXDOMAIN/SERVFAIL. Independently configurable TTLs.</p>
+                </div>
+
+                <div class="feature-card">
+                    <span class="feature-icon">🩺</span>
+                    <h3>Intelligent Healthchecks</h3>
+                    <p>Failure detection with tolerance (N consecutive failures) and degraded mode to prevent total lockouts.</p>
+                </div>
+
+                <div class="feature-card">
+                    <span class="feature-icon">📊</span>
+                    <h3>Prometheus Metrics</h3>
+                    <p>Native exposure of 10+ metrics: P50/P90/P99 latency, RPS, backend status, cache hits/misses, errors by type.</p>
+                </div>
+
+                <div class="feature-card">
+                    <span class="feature-icon">🛡️</span>
+                    <h3>Systemd Hardening</h3>
+                    <p>ProtectSystem=strict, LogsDirectory, Restart=always, LimitNOFILE. Maximum isolation, zero attack surface.</p>
+                </div>
+
+                <div class="feature-card">
+                    <span class="feature-icon">🌐</span>
+                    <h3>UDP + TCP Simultaneous</h3>
+                    <p>Full support for both protocols, with TCP framing and pipelining handling for large payloads (AXFR).</p>
+                </div>
+
+                <div class="feature-card">
+                    <span class="feature-icon">📡</span>
+                    <h3>Lightweight Client Tracking</h3>
+                    <p>Per-IP counting via internal hash table with on-demand JSON dump. Zero Prometheus cardinality explosion.</p>
+                </div>
+
+                <div class="feature-card">
+                    <span class="feature-icon">⚡</span>
+                    <h3>Zero Dependencies</h3>
+                    <p>CGO_ENABLED=0 static binary. Single-file deployment, compatible with all Linux, containers, BSD.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- PERFORMANCE -->
+    <section class="perf-section">
+        <div class="container">
+            <h2 class="section-title">Measured Performance</h2>
+            <p class="section-subtitle">Benchmarks run with 1000 concurrent workers on localhost.</p>
+
+            <div class="perf-grid">
+                <div class="perf-card">
+                    <div class="perf-value">4369</div>
+                    <div class="perf-label">Requests / Second</div>
+                </div>
+                <div class="perf-card">
+                    <div class="perf-value">0.23ms</div>
+                    <div class="perf-label">Average Latency</div>
+                </div>
+                <div class="perf-card">
+                    <div class="perf-value">99.3%</div>
+                    <div class="perf-label">Success Rate</div>
+                </div>
+                <div class="perf-card">
+                    <div class="perf-value">8 MB</div>
+                    <div class="perf-label">Binary Size</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- DASHBOARD -->
+    <section>
+        <div class="container">
+            <h2 class="section-title">Native Observability</h2>
+            <p class="section-subtitle">Ready-to-use Grafana dashboard, importable in one click.</p>
+
+            <div class="screenshot-wrapper">
+                <img src="grafana_dashboard_dns_lb.png" alt="DNS-LB Grafana Dashboard">
+            </div>
+        </div>
+    </section>
+
+    <!-- ARCHITECTURE -->
+    <section class="perf-section">
+        <div class="container">
+            <h2 class="section-title">Architecture</h2>
+            <p class="section-subtitle">DNS request flow through the proxy.</p>
+
+            <div class="arch-diagram">
+<pre style="display:inline-block;text-align:left;">
+    <span class="highlight-2">DNS Client</span>
+         │
+         ▼
+   ┌─────────────────────────────────────┐
+   │         <span class="highlight">DNS-LB Proxy</span>               │
+   │                                     │
+   │  1. Parse request (miekg/dns)       │
+   │  2. <span class="highlight">Cache lookup</span> (positive/negative)│
+   │     ├─ HIT  → Immediate response    │
+   │     └─ MISS → Select backend        │
+   │  3. <span class="highlight">Round-robin</span> (thread-safe)       │
+   │  4. Forward UDP/TCP to backend      │
+   │  5. Update cache + metrics          │
+   └─────────────────────────────────────┘
+         │                │
+         ▼                ▼
+   <span class="highlight-2">Backend 1</span>        <span class="highlight-2">Backend 2</span>
+   (BIND/Unbound)   (PowerDNS/CoreDNS)
+</pre>
+            </div>
+        </div>
+    </section>
+
+    <!-- QUICKSTART -->
+    <section id="quickstart">
+        <div class="container">
+            <h2 class="section-title">Quick Start</h2>
+            <p class="section-subtitle">From zero to production in 3 commands.</p>
+
+            <div class="code-block">
+<code><span class="comment"># 1. Build (static binary)</span>
+<span class="cmd">CGO_ENABLED</span>=0 <span class="cmd">GOOS</span>=linux <span class="cmd">GOARCH</span>=amd64 \
+  <span class="cmd">go build</span> <span class="flag">-a</span> <span class="flag">-installsuffix cgo</span> <span class="flag">-o</span> dns-lb dns-lb.go
+
+<span class="comment"># 2. Launch with cache and debug</span>
+<span class="cmd">DNS_BACKENDS=8.8.8.8:53,8.8.4.4:53 ./dns-lb</span> <span class="flag">-port</span> <span class="string">5353</span> \
+              <span class="flag">-cache-positive</span> <span class="flag">-cache-positive-ttl</span> <span class="string">1h</span> \
+              <span class="flag">-cache-negative</span> <span class="flag">-cache-negative-ttl</span> <span class="string">60s</span> \
+              <span class="flag">-debug</span>
+
+<span class="comment"># 3. Verify</span>
+<span class="cmd">dig</span> @localhost -p5353 <span class="string">example.com</span> +short
+<span class="cmd">curl</span> localhost:9100/metrics | grep dns_lb</code>
+            </div>
+
+            <p style="text-align:center; color:var(--text-muted); margin-top:2rem;">
+                📘 For complete systemd deployment (service, logrotate, firewall), 
+                check the documentation on GitHub.
+            </p>
+        </div>
+    </section>
+
+    <!-- FOOTER -->
+    <footer>
+        <div class="container">
+            <p>
+                <strong>DNS-LB</strong> — Built with ❤️ in Go, for the DevOps/SRE community.
+            </p>
+            <p>
+                <a href="https://github.com/T0aD/go-dns-lb">GitHub</a> · 
+                <a href="https://github.com/T0aD/go-dns-lb/issues">Report a Bug</a> · 
+                MIT License
+            </p>
+            <p style="margin-top:2rem; font-size:0.85rem;">
+                © 2026 — Open source project. No warranty, use at your own risk.
+            </p>
+        </div>
+    </footer>
+
+</body>
+</html>
