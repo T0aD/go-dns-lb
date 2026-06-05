@@ -67,7 +67,7 @@ curl -s http://localhost:9100/metrics | grep dns_lb
 | `-cache-negative-ttl` | `60s` | TTL for negative cache. |
 | `-debug` | `false` | Enable detailed DNS query logging. |
 | `-log` | `stdout` | Path to log file (dual-output with journald). |
-
+| `-zombie-check-domain` | `` | Domain to use for zombie check. If a response asking for this record is empty, then backend is marked as unhealthy |
 ---
 
 ## 🏗️ Systemd Deployment (Production)

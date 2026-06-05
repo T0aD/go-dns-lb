@@ -31,7 +31,9 @@ import (
 	// for stats dump
 	"encoding/json"
 	"bytes"
+
 )
+
 
 type CacheEntry struct {
 	Response *dns.Msg
@@ -89,10 +91,23 @@ var (
 		[]string{"cache_type"},
 	)
 
+	emptyAnswersTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dns_lb_empty_answers_total",
+			Help: "Number of NOERROR responses with 0 records in Answer section",
+		},
+		[]string{"backend"},
+	)
+
 	// stats
 	clientStats = make(map[string]*atomic.Int64)
 	clientStatsMu sync.RWMutex
 	statsFilePath = "/var/log/dns-lb/client-stats.json"
+
+	// zombie check
+	zombieCheckDomain string
+
+	appVersion = "260605-zombie"
 )
 
 // buffer pool to use during runUDPServer
@@ -103,11 +118,15 @@ var bufferPool = sync.Pool{
 	},
 }
 
+/*
 var dnsProbe = []byte{
 	0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00,
 	0x00, 0x01, 0x00, 0x01,
 }
+*/
+var dnsProbe []byte
+
 
 // 📊 Prometheus Metrics
 var (
@@ -138,11 +157,21 @@ var (
 	malformedPackets = prometheus.NewCounter(
 		prometheus.CounterOpts{Name: "dns_lb_malformed_packets_total", Help: "Invalid/short packets dropped"},
 	)
+	
+	buildInfo = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "dns_lb_build_info",
+			Help: "Build information (version, commit, go version) exposed as a constant 1.",
+		},
+		[]string{"version"},
+	)
 )
 
 func init() {
-	prometheus.MustRegister(requestsTotal, responseDuration, backendHealth, activeBackends, errorsTotal, malformedPackets)
-	prometheus.MustRegister(cacheHits, cacheMisses, cacheSize)
+	prometheus.MustRegister(requestsTotal, responseDuration, backendHealth, activeBackends, errorsTotal, malformedPackets, emptyAnswersTotal)
+	prometheus.MustRegister(cacheHits, cacheMisses, cacheSize, buildInfo)
+
+	buildInfo.WithLabelValues(appVersion).Set(1)
 }
 
 
@@ -234,9 +263,26 @@ func checkBackend(addr string) {
 
 	conn.SetReadDeadline(time.Now().Add(healthTimeout))
 	buf := make([]byte, 512)
-	if _, err := conn.Read(buf); err != nil {
+	n, err := conn.Read(buf)
+	if err != nil {
 		setHealthy(addr, false)
 		return
+	}
+
+	if zombieCheckDomain != "" {
+		resp := new(dns.Msg)
+		if err := resp.Unpack(buf[:n]); err != nil {
+			setHealthy(addr, false)
+			return
+		}
+
+		// Si le serveur répond NOERROR (succès) mais que la section Answer est vide...
+		// ...c'est que la DB est probablement déconnectée (pour un serveur autoritaire).
+		if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
+			log.Printf("⚠️ Backend %s returned NOERROR but EMPTY answer (DB down?). Marking DOWN.", addr)
+			setHealthy(addr, false)
+			return
+		}
 	}
 
 	// ✅ Succès : marquer comme sain
@@ -550,6 +596,13 @@ func resolveRequest(req *dns.Msg, clientProto string) (resp *dns.Msg, target str
 		return nil, target, false, backendErr
 	}
 
+	if resp != nil {
+		// if response is empty, update counter
+		if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
+			emptyAnswersTotal.WithLabelValues(target).Inc()
+		}
+	}
+
 	// 4. Mise à jour du Cache avec la réponse fraîche
 	if cacheKey != "" {
 		cacheMu.Lock()
@@ -846,6 +899,19 @@ func dumpClientStats() {
 	log.Printf("📥 Dumped %d client IP statistics to %s", len(snapshot), statsFilePath)
 }
 
+func initDnsProbe(domain string) {
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(domain), dns.TypeA) 
+	msg.RecursionDesired = true
+	
+	var err error
+	dnsProbe, err = msg.Pack()
+	if err != nil {
+		log.Fatalf("❌ Impossible to generate DNS probe for domain '%s': %v", domain, err)
+	}	
+	log.Printf("✅ DNS Probe initialized for domain: %s (%d bytes)", dns.Fqdn(domain), len(dnsProbe))
+}
+
 func main() {
 	var port int
 	var logFile string
@@ -859,6 +925,8 @@ func main() {
 	flag.BoolVar(&enableNegativeCache, "cache-negative", false, "Enable negative DNS cache (errors)")
 	flag.DurationVar(&positiveCacheTTL, "cache-positive-ttl", 1*time.Hour, "TTL for positive cache (e.g., 1h, 30m, 60s)")
 	flag.DurationVar(&negativeCacheTTL, "cache-negative-ttl", 60*time.Second, "TTL for negative cache (e.g., 1h, 30m, 60s)")
+
+	flag.StringVar(&zombieCheckDomain, "zombie-check-domain", "", "Domain to use for zombie check. If a response asking for this record is empty, then backend is marked as unhealthy")
 	
 	flag.Parse()
 
@@ -896,6 +964,12 @@ func main() {
 		}
 		setHealthy(backends[i], true)
 	}
+
+	if zombieCheckDomain != "" {
+		initDnsProbe(zombieCheckDomain)
+	} else {
+		initDnsProbe("example.com")
+	}	
 
 	listenAddr := fmt.Sprintf(":%d", port)
 	log.Printf("Starting DNS UDP LB on %s, backends: %v", listenAddr, backends)
