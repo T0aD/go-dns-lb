@@ -248,16 +248,29 @@ func healthcheck(ctx context.Context) {
 
 
 func checkBackend(addr string) {
+	// get current status
+	isCurrentlyDown := func() bool {
+		mu.RLock()
+		defer mu.RUnlock()
+		return !healthy[addr] 
+	}
+
 	conn, err := net.DialTimeout("udp", addr, healthTimeout)
 	if err != nil {
-		setHealthy(addr, false)
+		if !isCurrentlyDown() {
+			log.Printf("⚠️ Backend %s couldnt UDP connect. Marking DOWN.", addr)
+			setHealthy(addr, false)
+		}
 		return
 	}
 	defer conn.Close()
 
 	conn.SetWriteDeadline(time.Now().Add(healthTimeout))
 	if _, err := conn.Write(dnsProbe); err != nil {
-		setHealthy(addr, false)
+		if !isCurrentlyDown() {
+			log.Printf("⚠️ Backend %s couldnt write to UDP. Marking DOWN.", addr)
+			setHealthy(addr, false)
+		}
 		return
 	}
 
@@ -265,28 +278,46 @@ func checkBackend(addr string) {
 	buf := make([]byte, 512)
 	n, err := conn.Read(buf)
 	if err != nil {
-		setHealthy(addr, false)
+		if !isCurrentlyDown() {
+			log.Printf("⚠️ Backend %s couldnt read from UDP. Marking DOWN.", addr)
+			setHealthy(addr, false)
+		}
 		return
 	}
 
-	if zombieCheckDomain != "" {
-		resp := new(dns.Msg)
-		if err := resp.Unpack(buf[:n]); err != nil {
+	resp := new(dns.Msg)
+	if err := resp.Unpack(buf[:n]); err != nil {
+		if !isCurrentlyDown() {
+			log.Printf("⚠️ Backend %s couldnt unpack server response. Marking DOWN.", addr)
 			setHealthy(addr, false)
-			return
 		}
+		return
+	}
 
-		// Si le serveur répond NOERROR (succès) mais que la section Answer est vide...
-		// ...c'est que la DB est probablement déconnectée (pour un serveur autoritaire).
-		if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
+	if resp.Rcode == dns.RcodeServerFailure || 
+		resp.Rcode == dns.RcodeRefused ||
+		resp.Rcode == dns.RcodeNameError ||
+		resp.Rcode == dns.RcodeNotImplemented {
+		if !isCurrentlyDown() {
+			log.Printf("⚠️ Backend %s returned error RCODE %d %s . Marking DOWN.", addr, resp.Rcode, dns.RcodeToString[resp.Rcode])
+			setHealthy(addr, false)
+		}
+		return
+	}
+
+	// Empty answer but success
+	if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
+		if !isCurrentlyDown() {
 			log.Printf("⚠️ Backend %s returned NOERROR but EMPTY answer (DB down?). Marking DOWN.", addr)
 			setHealthy(addr, false)
-			return
 		}
+		return
 	}
 
 	// ✅ Succès : marquer comme sain
-	setHealthy(addr, true)
+	if isCurrentlyDown() {
+		setHealthy(addr, true)
+	}
 }
 
 
