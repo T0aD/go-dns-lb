@@ -69,6 +69,10 @@ var (
 	positiveCacheTTL    time.Duration
 	negativeCacheTTL    time.Duration
 
+	// failures management
+	failureCounts   = make(map[string]int)
+	failureCountsMu sync.Mutex
+	failureThreshold = 3
 
 	cacheHits = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -175,6 +179,24 @@ func init() {
 }
 
 
+func incrementFailureCount(addr string) {
+    failureCountsMu.Lock()
+    defer failureCountsMu.Unlock()
+    failureCounts[addr]++
+}
+
+func getFailureCount(addr string) int {
+    failureCountsMu.Lock()
+    defer failureCountsMu.Unlock()
+    return failureCounts[addr]
+}
+
+func resetFailureCount(addr string) {
+    failureCountsMu.Lock()
+    defer failureCountsMu.Unlock()
+    failureCounts[addr] = 0
+}
+
 func setHealthy(addr string, status bool) {
 	mu.Lock()
 	
@@ -258,7 +280,8 @@ func checkBackend(addr string) {
 	conn, err := net.DialTimeout("udp", addr, healthTimeout)
 	if err != nil {
 		if !isCurrentlyDown() {
-			log.Printf("⚠️ Backend %s couldnt UDP connect. Marking DOWN.", addr)
+			incrementFailureCount(addr)
+			log.Printf("⚠️  Backend %s couldnt UDP connect. Marking DOWN. %d/%d", addr, getFailureCount(addr), failureThreshold)
 			setHealthy(addr, false)
 		}
 		return
@@ -268,7 +291,8 @@ func checkBackend(addr string) {
 	conn.SetWriteDeadline(time.Now().Add(healthTimeout))
 	if _, err := conn.Write(dnsProbe); err != nil {
 		if !isCurrentlyDown() {
-			log.Printf("⚠️ Backend %s couldnt write to UDP. Marking DOWN.", addr)
+			incrementFailureCount(addr)
+			log.Printf("⚠️  Backend %s couldnt write to UDP. Marking DOWN. %d/%d", addr, getFailureCount(addr), failureThreshold)
 			setHealthy(addr, false)
 		}
 		return
@@ -279,7 +303,8 @@ func checkBackend(addr string) {
 	n, err := conn.Read(buf)
 	if err != nil {
 		if !isCurrentlyDown() {
-			log.Printf("⚠️ Backend %s couldnt read from UDP. Marking DOWN.", addr)
+			incrementFailureCount(addr)
+			log.Printf("⚠️  Backend %s couldnt read from UDP. Marking DOWN. %d/%d", addr, getFailureCount(addr), failureThreshold)
 			setHealthy(addr, false)
 		}
 		return
@@ -288,7 +313,8 @@ func checkBackend(addr string) {
 	resp := new(dns.Msg)
 	if err := resp.Unpack(buf[:n]); err != nil {
 		if !isCurrentlyDown() {
-			log.Printf("⚠️ Backend %s couldnt unpack server response. Marking DOWN.", addr)
+			incrementFailureCount(addr)
+			log.Printf("⚠️  Backend %s couldnt unpack server response. Marking DOWN. %d/%d", addr, getFailureCount(addr), failureThreshold)
 			setHealthy(addr, false)
 		}
 		return
@@ -299,7 +325,8 @@ func checkBackend(addr string) {
 		resp.Rcode == dns.RcodeNameError ||
 		resp.Rcode == dns.RcodeNotImplemented {
 		if !isCurrentlyDown() {
-			log.Printf("⚠️ Backend %s returned error RCODE %d %s . Marking DOWN.", addr, resp.Rcode, dns.RcodeToString[resp.Rcode])
+			incrementFailureCount(addr)
+			log.Printf("⚠️  Backend %s returned error RCODE %d %s . Marking DOWN. %d/%d", addr, resp.Rcode, dns.RcodeToString[resp.Rcode], getFailureCount(addr), failureThreshold)
 			setHealthy(addr, false)
 		}
 		return
@@ -308,7 +335,8 @@ func checkBackend(addr string) {
 	// Empty answer but success
 	if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
 		if !isCurrentlyDown() {
-			log.Printf("⚠️ Backend %s returned NOERROR but EMPTY answer (DB down?). Marking DOWN.", addr)
+			incrementFailureCount(addr)
+			log.Printf("⚠️  Backend %s returned NOERROR but EMPTY answer (DB down?). Marking DOWN. %d/%d", addr, getFailureCount(addr), failureThreshold)
 			setHealthy(addr, false)
 		}
 		return
@@ -316,6 +344,7 @@ func checkBackend(addr string) {
 
 	// ✅ Succès : marquer comme sain
 	if isCurrentlyDown() {
+		resetFailureCount(addr)
 		setHealthy(addr, true)
 	}
 }
