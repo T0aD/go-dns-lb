@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"bytes"
 
+	"crypto/subtle"
 )
 
 
@@ -112,6 +113,9 @@ var (
 	zombieCheckDomain string
 
 	appVersion = "260605-zombie"
+
+	metricsUser string
+	metricsPass string
 )
 
 // buffer pool to use during runUDPServer
@@ -972,6 +976,27 @@ func initDnsProbe(domain string) {
 	log.Printf("✅ DNS Probe initialized for domain: %s (%d bytes)", dns.Fqdn(domain), len(dnsProbe))
 }
 
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if metricsUser == "" && metricsPass == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		user, pass, ok := r.BasicAuth()
+
+		// On utilise subtle.ConstantTimeCompare pour éviter les attaques par temps de réponse
+		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(metricsUser)) != 1 || subtle.ConstantTimeCompare([]byte(pass), []byte(metricsPass)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="dns-lb metrics", charset="UTF-8"`)
+
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		// Tout est bon, on laisse passer la requête vers le handler Prometheus
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	var port int
 	var logFile string
@@ -987,7 +1012,10 @@ func main() {
 	flag.DurationVar(&negativeCacheTTL, "cache-negative-ttl", 60*time.Second, "TTL for negative cache (e.g., 1h, 30m, 60s)")
 
 	flag.StringVar(&zombieCheckDomain, "zombie-check-domain", "", "Domain to use for zombie check. If a response asking for this record is empty, then backend is marked as unhealthy")
-	
+
+	flag.StringVar(&metricsUser, "metrics-user", "", "Username for Prometheus exporter")
+	flag.StringVar(&metricsPass, "metrics-pass", "", "Password for Prometheus exporter")
+
 	flag.Parse()
 
 
@@ -1043,7 +1071,9 @@ func main() {
 	// 🚀 Prometheus metrics server
 	go func() {
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.Handler())
+		protectedMetrics := authMiddleware(promhttp.Handler())
+		// mux.Handle("/metrics", promhttp.Handler())
+		mux.Handle("/metrics", protectedMetrics)
 		log.Printf("Prometheus metrics listening on :%d/metrics", metricsPort)
 		if err := http.ListenAndServe(fmt.Sprintf(":%d", metricsPort), mux); err != nil && err != http.ErrServerClosed {
 			log.Printf("Metrics server failed: %v", err)
