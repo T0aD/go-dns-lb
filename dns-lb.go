@@ -114,8 +114,22 @@ var (
 
 	appVersion = "260605-zombie"
 
+	// Prometheus authentication
 	metricsUser string
 	metricsPass string
+
+	// Domain | type metrics
+	queryCountMu	sync.RWMutex
+	queryCountLocal = make(map[string]uint64) // key= domain|type
+	queryThreshold uint64 = 10
+
+	queriesExposed = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "dns_lb_queries_by_domain_total",
+			Help: "Total queries per domain/type (only domains exceeding threshold are exposed)",
+		},
+		[]string{"domain", "type"},
+	)
 )
 
 // buffer pool to use during runUDPServer
@@ -177,9 +191,53 @@ var (
 
 func init() {
 	prometheus.MustRegister(requestsTotal, responseDuration, backendHealth, activeBackends, errorsTotal, malformedPackets, emptyAnswersTotal)
-	prometheus.MustRegister(cacheHits, cacheMisses, cacheSize, buildInfo)
+	prometheus.MustRegister(cacheHits, cacheMisses, cacheSize, buildInfo, queriesExposed)
 
 	buildInfo.WithLabelValues(appVersion).Set(1)
+
+	// flush periodically queries metrics
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		for range ticker.C {
+			flushQueryCounts()
+		}
+	}()
+}
+
+
+// Incrémenter le compteur local (appelé dans handleUDP/handleTCP)
+func incrementQueryCount(domain, qtype string) {
+	key := domain + "|" + qtype
+
+	queryCountMu.Lock()
+	queryCountLocal[key]++
+	queryCountMu.Unlock()
+}
+
+// Flush vers Prometheus (seulement si > threshold)
+func flushQueryCounts() {
+	queryCountMu.RLock()
+	defer queryCountMu.RUnlock()
+
+	// Réinitialiser la GaugeVec (sinon les anciens domaines restent)
+	queriesExposed.Reset()
+
+	for key, count := range queryCountLocal {
+		if count >= queryThreshold {
+			parts := splitKey(key) // domain|type -> [domain, type]
+			queriesExposed.WithLabelValues(parts[0], parts[1]).Set(float64(count))
+		}
+	}
+}
+
+func splitKey(key string) []string {
+	// Simple split sur "|"
+	for i := 0; i < len(key); i++ {
+		if key[i] == '|' {
+			return []string{key[:i], key[i+1:]}
+		}
+	}
+	return []string{key, "UNKNOWN"}
 }
 
 
@@ -495,6 +553,23 @@ func cleanExpiredCache() {
 }
 
 
+// @todo to add in handleTCPConn + forwardRequest
+func blockANYRequest(req *dns.Msg) (*dns.Msg) {
+	// Refuse with an HINFO record
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	resp.Rcode = dns.RcodeSuccess
+    
+	hinfo := &dns.HINFO{
+		Hdr: dns.RR_Header{Name: req.Question[0].Name, Rrtype: dns.TypeHINFO, Class: dns.ClassINET, Ttl: 0},
+		Cpu: "ANY", 
+		Os:  "RFC 8482",
+	}
+	resp.Answer = append(resp.Answer, hinfo)
+	return resp
+}
+
+
 func forwardRequest(conn *net.UDPConn, buf []byte, n int, client *net.UDPAddr) {
 	start := time.Now()
 
@@ -513,6 +588,16 @@ func forwardRequest(conn *net.UDPConn, buf []byte, n int, client *net.UDPAddr) {
 		qtype := dns.TypeToString[q.Qtype]
 		if qtype == "" { qtype = fmt.Sprintf("TYPE%d", q.Qtype) }
 		log.Printf("[DEBUG] UDP Query from %s: %s %s", client.String(), q.Name, qtype)
+	}
+
+	if len(req.Question) > 0 {
+		q := req.Question[0]
+		qtype := dns.TypeToString[q.Qtype]
+		domain := strings.ToLower(q.Name)
+		if qtype == "" {
+			qtype = "OTHER"
+		}
+		incrementQueryCount(domain, qtype)
 	}
 
 	resp, target, isHit, err := resolveRequest(req, "udp")
@@ -595,13 +680,13 @@ func forwardToBackendTCP(target string, req *dns.Msg) (*dns.Msg, error) {
 
 	respBytes := make([]byte, respLen)
 	if _, err := io.ReadFull(conn, respBytes); err != nil {
-		errorsTotal.WithLabelValues("read_fail").Inc() // 🚀 RESTAURÉ
+		errorsTotal.WithLabelValues("read_fail").Inc()
 		return nil, err
 	}
 
 	resp := new(dns.Msg)
 	if err := resp.Unpack(respBytes); err != nil {
-		errorsTotal.WithLabelValues("unpack_fail").Inc() // 🚀 RESTAURÉ
+		errorsTotal.WithLabelValues("unpack_fail").Inc()
 		return nil, err
 	}
 	return resp, nil
@@ -818,6 +903,16 @@ func handleTCPConn(conn net.Conn) {
 			qtype := dns.TypeToString[q.Qtype]
 			if qtype == "" { qtype = fmt.Sprintf("TYPE%d", q.Qtype) }
 			log.Printf("[DEBUG] TCP Query from %s: %s %s", conn.RemoteAddr().String(), q.Name, qtype)
+		}
+
+		if len(req.Question) > 0 {
+			q := req.Question[0]
+			qtype := dns.TypeToString[q.Qtype]
+			domain := strings.ToLower(q.Name)
+			if qtype == "" {
+				qtype = "OTHER"
+			}
+			incrementQueryCount(domain, qtype)
 		}
 
 		resp, target, isHit, err := resolveRequest(req, "tcp")
