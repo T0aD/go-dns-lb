@@ -41,6 +41,8 @@ type CacheEntry struct {
 	ExpiresAt time.Time
 }
 
+
+
 const (
 	healthInterval = 10 * time.Second
 	healthTimeout  = 2 * time.Second
@@ -130,7 +132,32 @@ var (
 		},
 		[]string{"domain", "type"},
 	)
+
+	// Rate limit (amplification attack protection)
+	rateLimitWindow			= 60 * time.Second
+	rateLimitThreshold uint64	= 50
+
+	// main parameters
+	rateLimitWindowSec	int
+	rateLimitMaxQueries	int
+
+	rateLimitMu		sync.Mutex
+	rateLimitData		= make(map[string]*RateLimitEntry)
+
+	rateLimitedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dns_lb_rate_limited_total",
+			Help: "Total number of queries rate-limited by IP/domain/type",
+		},
+		[]string{"ip", "domain", "type"},
+	)
 )
+
+type RateLimitEntry struct {
+	count			uint64
+	windowEnd		time.Time
+}
+
 
 // buffer pool to use during runUDPServer
 var bufferPool = sync.Pool{
@@ -191,7 +218,7 @@ var (
 
 func init() {
 	prometheus.MustRegister(requestsTotal, responseDuration, backendHealth, activeBackends, errorsTotal, malformedPackets, emptyAnswersTotal)
-	prometheus.MustRegister(cacheHits, cacheMisses, cacheSize, buildInfo, queriesExposed)
+	prometheus.MustRegister(cacheHits, cacheMisses, cacheSize, buildInfo, queriesExposed, rateLimitedTotal)
 
 	buildInfo.WithLabelValues(appVersion).Set(1)
 
@@ -202,6 +229,68 @@ func init() {
 			flushQueryCounts()
 		}
 	}()
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		for range ticker.C {
+			cleanupRateLimits()
+		}
+	}()
+	
+}
+
+// isRateLimited vérifie si la requête doit être bloquée
+func isRateLimited(ip, domain, qtype string) bool {
+	key := fmt.Sprintf("%s|%s|%s", ip, domain, qtype)
+	now := time.Now()
+    
+	rateLimitMu.Lock()
+	defer rateLimitMu.Unlock()
+    
+	entry, exists := rateLimitData[key]
+    
+	// Première requête ou nouvelle fenêtre
+	if !exists || now.After(entry.windowEnd) {
+		if exists {
+			log.Printf("✅ Rate limit reset for %s on %s %s (window expired)", ip, domain, qtype)
+		}
+
+		rateLimitData[key] = &RateLimitEntry{
+			count:     1,
+			windowEnd: now.Add(rateLimitWindow),
+		}
+		return false
+	}
+    
+	// Incrémenter le compteur
+	entry.count++
+
+	if entry.count == rateLimitThreshold {
+		log.Printf("🚨 Rate limit exceeded for %s on %s %s (%d queries in %v)", 
+			ip, domain, qtype, entry.count, rateLimitWindow)
+	}
+	
+	// Vérifier si on dépasse le seuil
+	if entry.count >= rateLimitThreshold {
+		// Incrémenter la métrique Prometheus
+		rateLimitedTotal.WithLabelValues(ip, domain, qtype).Inc()
+		return true
+	}
+    
+	return false
+}
+
+func cleanupRateLimits() {
+	log.Printf("Cleaning rate limits....")
+	rateLimitMu.Lock()
+	defer rateLimitMu.Unlock()
+
+	now := time.Now()
+	for key, entry := range rateLimitData {
+	    if now.After(entry.windowEnd) {
+		    delete(rateLimitData, key)
+	    }
+	}
 }
 
 
@@ -582,7 +671,37 @@ func forwardRequest(conn *net.UDPConn, buf []byte, n int, client *net.UDPAddr) {
 		return
 	}
 
-	// 🚀 DEBUG RESTAURÉ (et simplifié grâce au parsing miekg/dns)
+	if len(req.Question) > 0 {
+		q := req.Question[0]
+		qtype := dns.TypeToString[q.Qtype]
+		domain := strings.ToLower(q.Name)
+		clientIP := client.IP.String()
+		if qtype == "" {
+			qtype = "OTHER"
+		}
+
+		// check rate limit
+		if isRateLimited(clientIP, domain, qtype) {
+			//log.Printf("🚨 Rate limit exceeded for %s on %s %s", clientIP, domain, qtype)
+            
+			// Renvoyer SERVFAIL immédiatement
+			resp := new(dns.Msg)
+			resp.SetRcode(req, dns.RcodeServerFailure)
+
+			// Pack la réponse en bytes
+			respBytes, err := resp.Pack()
+			if err != nil {
+				return
+			}
+
+			conn.WriteTo(respBytes, client)
+			return
+		}
+
+		incrementQueryCount(domain, qtype)
+	}
+
+	// debug after rate limiting to hide floods...
 	if debugMode && len(req.Question) > 0 {
 		q := req.Question[0]
 		qtype := dns.TypeToString[q.Qtype]
@@ -590,15 +709,6 @@ func forwardRequest(conn *net.UDPConn, buf []byte, n int, client *net.UDPAddr) {
 		log.Printf("[DEBUG] UDP Query from %s: %s %s", client.String(), q.Name, qtype)
 	}
 
-	if len(req.Question) > 0 {
-		q := req.Question[0]
-		qtype := dns.TypeToString[q.Qtype]
-		domain := strings.ToLower(q.Name)
-		if qtype == "" {
-			qtype = "OTHER"
-		}
-		incrementQueryCount(domain, qtype)
-	}
 
 	resp, target, isHit, err := resolveRequest(req, "udp")
 	if err != nil {
@@ -905,12 +1015,33 @@ func handleTCPConn(conn net.Conn) {
 			log.Printf("[DEBUG] TCP Query from %s: %s %s", conn.RemoteAddr().String(), q.Name, qtype)
 		}
 
+		
 		if len(req.Question) > 0 {
 			q := req.Question[0]
 			qtype := dns.TypeToString[q.Qtype]
 			domain := strings.ToLower(q.Name)
 			if qtype == "" {
 				qtype = "OTHER"
+			}
+
+			if isRateLimited(clientIP, domain, qtype) {
+				resp := new(dns.Msg)
+				resp.SetRcode(req, dns.RcodeServerFailure)
+        
+				// Pack la réponse
+				respBytes, err := resp.Pack()
+				if err != nil {
+					return
+				}
+        
+				// 🚀 AJOUT DU FRAMING TCP (2 octets de longueur)
+				length := uint16(len(respBytes))
+				lengthPrefix := []byte{byte(length >> 8), byte(length & 0xFF)}
+
+				// Envoi : longueur + payload
+				conn.Write(lengthPrefix)
+				conn.Write(respBytes)
+				return
 			}
 			incrementQueryCount(domain, qtype)
 		}
@@ -932,6 +1063,25 @@ func handleTCPConn(conn net.Conn) {
 		requestsTotal.WithLabelValues(target, "success").Inc()
 		responseDuration.WithLabelValues(cacheLabel).Observe(time.Since(start).Seconds())
 	}
+}
+
+/* Framing TCP (not used yet) */
+func writeTCPResponse(conn net.Conn, resp *dns.Msg) error {
+	respBytes, err := resp.Pack()
+	if err != nil {
+		return err
+	}
+
+	length := uint16(len(respBytes))
+	lengthPrefix := []byte{byte(length >> 8), byte(length & 0xFF)}
+
+	if _, err := conn.Write(lengthPrefix); err != nil {
+		return err
+	}
+	if _, err := conn.Write(respBytes); err != nil {
+		return err
+	}
+	return nil
 }
 
 /* @obosolete */
@@ -1110,6 +1260,13 @@ func main() {
 
 	flag.StringVar(&metricsUser, "metrics-user", "", "Username for Prometheus exporter")
 	flag.StringVar(&metricsPass, "metrics-pass", "", "Password for Prometheus exporter")
+
+	flag.IntVar(&rateLimitWindowSec, "rate-limit-window", 60, "Rate limit window in seconds")
+	flag.IntVar(&rateLimitMaxQueries, "rate-limit-max", 50, "Max queries per IP/domain/type in window")
+	flag.Parse()
+    
+	rateLimitWindow = time.Duration(rateLimitWindowSec) * time.Second
+	rateLimitThreshold = uint64(rateLimitMaxQueries)
 
 	flag.Parse()
 
