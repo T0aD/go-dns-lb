@@ -33,6 +33,9 @@ import (
 	"bytes"
 
 	"crypto/subtle"
+
+	// firewall
+	"os/exec"
 )
 
 
@@ -135,27 +138,43 @@ var (
 
 	// Rate limit (amplification attack protection)
 	rateLimitWindow			= 60 * time.Second
-	rateLimitThreshold uint64	= 50
+	rateLimitThreshold uint64	= 120
 
 	// main parameters
 	rateLimitWindowSec	int
 	rateLimitMaxQueries	int
 
-	rateLimitMu		sync.Mutex
+	rateLimitMu		sync.RWMutex
 	rateLimitData		= make(map[string]*RateLimitEntry)
 
 	rateLimitedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "dns_lb_rate_limited_total",
-			Help: "Total number of queries rate-limited by IP/domain/type",
+			Help: "Total number of queries rate-limited by IP/domain/type/level",
 		},
-		[]string{"ip", "domain", "type"},
+		[]string{"ip", "domain", "type", "level"},
 	)
+
+	warnThreshold		uint64 = 10
+	blockThreshold		uint64 = 20
+	banThreshold		uint64 = 60
+
+	banDurations = []time.Duration{
+		5 * time.Minute,
+		30 * time.Minute,
+		2 * time.Hour,
+		24 * time.Hour,
+	}
+
+	banStateFile	string
 )
 
 type RateLimitEntry struct {
 	count			uint64
 	windowEnd		time.Time
+	banCount		int
+	banUntil		time.Time
+	lastSeen		time.Time
 }
 
 
@@ -239,6 +258,84 @@ func init() {
 	
 }
 
+
+func checkRateLimit(ip, domain, qtype string) (blocked bool, level string) {
+	key := fmt.Sprintf("%s|%s|%s", ip, domain, qtype)
+	now := time.Now()
+
+	rateLimitMu.Lock()
+	defer rateLimitMu.Unlock()
+
+	entry, exists := rateLimitData[key]
+    
+	// Si l'IP est actuellement bannie, vérifier si le ban a expiré
+	if exists && !entry.banUntil.IsZero() {
+		if now.Before(entry.banUntil) {
+			// Toujours banni → drop silencieux (pas de SERVFAIL)
+			return true, "banned"
+		}
+		// Ban expiré → reset partiel (on garde l'historique des bans)
+		entry.banUntil = time.Time{}
+		entry.count = 0
+		entry.windowEnd = now.Add(rateLimitWindow)
+	}
+    
+	// Première requête ou nouvelle fenêtre
+	if !exists || now.After(entry.windowEnd) {
+		if exists {
+			// Fenêtre expirée sans atteindre le seuil → reset complet
+			entry.count = 1
+			entry.windowEnd = now.Add(rateLimitWindow)
+		} else {
+			rateLimitData[key] = &RateLimitEntry{
+				count:     1,
+				windowEnd: now.Add(rateLimitWindow),
+				lastSeen:  now,
+			}
+		}
+		return false, ""
+	}
+    
+	// Incrémenter le compteur
+	entry.count++
+	entry.lastSeen = now
+    
+	// 🚨 NIVEAU 3 : BAN (backoff exponentiel)
+	if entry.count >= banThreshold {
+		banDuration := banDurations[entry.banCount]
+		if entry.banCount < len(banDurations)-1 {
+			entry.banCount++
+		}
+		entry.banUntil = now.Add(banDuration)
+		entry.count = 0 // Reset pour la prochaine fenêtre
+        
+		log.Printf("🚫 BANNED %s on %s %s for %v (ban #%d)", 
+			ip, domain, qtype, banDuration, entry.banCount)
+        
+		rateLimitedTotal.WithLabelValues(ip, domain, qtype, "ban").Inc()
+		return true, "banned"
+	}
+    
+	// 🚨 NIVEAU 2 : BLOCK (SERVFAIL)
+	if entry.count >= blockThreshold {
+		if entry.count == blockThreshold {
+			log.Printf("🚨 BLOCKED %s on %s %s (%d queries)", 
+				ip, domain, qtype, entry.count)
+		}
+		rateLimitedTotal.WithLabelValues(ip, domain, qtype, "block").Inc()
+		return true, "blocked"
+	}
+    
+	// ⚠️ NIVEAU 1 : WARN (log seulement)
+	if entry.count == warnThreshold {
+		log.Printf("⚠️  WARNING: %s approaching limit on %s %s (%d queries)", 
+			ip, domain, qtype, entry.count)
+		rateLimitedTotal.WithLabelValues(ip, domain, qtype, "warn").Inc()
+	}
+    
+	return false, ""
+}
+
 // isRateLimited vérifie si la requête doit être bloquée
 func isRateLimited(ip, domain, qtype string) bool {
 	key := fmt.Sprintf("%s|%s|%s", ip, domain, qtype)
@@ -281,6 +378,20 @@ func isRateLimited(ip, domain, qtype string) bool {
 }
 
 func cleanupRateLimits() {
+	rateLimitMu.Lock()
+	defer rateLimitMu.Unlock()
+    
+	now := time.Now()
+	for key, entry := range rateLimitData {
+		// Supprimer si : ban expiré depuis > 24h ET pas de requête depuis > 1h
+		if !entry.banUntil.IsZero() && now.Sub(entry.banUntil) > 24*time.Hour && 
+			now.Sub(entry.lastSeen) > time.Hour {
+			delete(rateLimitData, key)
+		}
+	}
+}
+
+func cleanupRateLimitsOLD() {
 	log.Printf("Cleaning rate limits....")
 	rateLimitMu.Lock()
 	defer rateLimitMu.Unlock()
@@ -291,6 +402,101 @@ func cleanupRateLimits() {
 		    delete(rateLimitData, key)
 	    }
 	}
+}
+
+
+
+// firewall ban!
+func banIPWithIptables(ip string, duration time.Duration) {
+	// Exécuter : iptables -I INPUT -s <ip> -j DROP
+	cmd := exec.Command("iptables", "-I", "INPUT", "-s", ip, "-m", "comment", "--comment", "banned by dns-lb rate limitor", "-j", "DROP")
+
+	out, err := cmd.CombinedOutput()
+	
+	if err != nil {
+		log.Printf("❌ Failed to ban IP %s: (err: %v) %s", ip, err, string(out))
+		return
+	} else {
+		log.Printf("🔥 IP %s successfully banned via iptables for %v", ip, duration)
+	}
+    
+	// Programmer la suppression après duration
+	go func() {
+		time.Sleep(duration)
+		log.Printf("⏰ Unbanning IP %s...", ip)
+		exec.Command("iptables", "-D", "INPUT", "-s", ip, "-m", "comment", "--comment", "banned by dns-lb rate limitor", "-j", "DROP")
+		out, err := cmd.CombinedOutput()	
+		if err != nil {
+			log.Printf("❌ Failed to unban IP %s: (err: %v) %s", ip, err, string(out))
+			return
+		}
+	}()
+}
+
+
+// saveBanState écrit l'état actuel sur le disque de manière atomique
+func saveBanState(filePath string) {
+    rateLimitMu.RLock()
+    // On copie la map pour ne pas bloquer le mutex trop longtemps
+    // et pour éviter d'écrire des données corrompues si la map change pendant l'écriture
+    dataToSave := make(map[string]*RateLimitEntry)
+    for k, v := range rateLimitData {
+        // Optionnel : on peut ne sauvegarder que les entrées actives (bannies ou avec un compteur > 0)
+        // pour éviter de gonfler le fichier inutilement.
+        if v.count > 0 || !v.banUntil.IsZero() {
+            dataToSave[k] = v
+        }
+    }
+    rateLimitMu.RUnlock()
+
+    // Écriture atomique : on écrit dans un fichier temporaire, puis on renomme
+    tmpFile := filePath + ".tmp"
+    file, err := os.Create(tmpFile)
+    if err != nil {
+        log.Printf("❌ Failed to create temp ban file: %v", err)
+        return
+    }
+
+    encoder := json.NewEncoder(file)
+    if err := encoder.Encode(dataToSave); err != nil {
+        file.Close()
+        os.Remove(tmpFile)
+        log.Printf(" Failed to encode ban state: %v", err)
+        return
+    }
+    file.Close()
+
+    // Le renommage est atomique sur les systèmes de fichiers POSIX (ext4, xfs, etc.)
+    if err := os.Rename(tmpFile, filePath); err != nil {
+        log.Printf("❌ Failed to rename ban file: %v", err)
+    }
+}
+
+// loadBanState charge l'état depuis le disque au démarrage
+func loadBanState(filePath string) {
+    file, err := os.Open(filePath)
+    if err != nil {
+        if os.IsNotExist(err) {
+            log.Printf("ℹ️ No ban state file found at %s, starting fresh.", filePath)
+        } else {
+            log.Printf("❌ Failed to open ban state file: %v", err)
+        }
+        return
+    }
+    defer file.Close()
+
+    rateLimitMu.Lock()
+    defer rateLimitMu.Unlock()
+
+    var loadedData map[string]*RateLimitEntry
+    decoder := json.NewDecoder(file)
+    if err := decoder.Decode(&loadedData); err != nil {
+        log.Printf("❌ Failed to decode ban state file: %v", err)
+        return
+    }
+
+    rateLimitData = loadedData
+    log.Printf("✅ Loaded %d ban/rate-limit entries from %s", len(loadedData), filePath)
 }
 
 
@@ -680,8 +886,21 @@ func forwardRequest(conn *net.UDPConn, buf []byte, n int, client *net.UDPAddr) {
 			qtype = "OTHER"
 		}
 
+		blocked, level := checkRateLimit(clientIP, domain, qtype)
+
+		if blocked {
+			if level == "banned" {
+				banIPWithIptables(clientIP, 24 * time.Hour)
+				// silent drop
+				return
+			}
+
+			// classic block, SERVFAIL
+			
+		//}
+		
 		// check rate limit
-		if isRateLimited(clientIP, domain, qtype) {
+		//if isRateLimited(clientIP, domain, qtype) {
 			//log.Printf("🚨 Rate limit exceeded for %s on %s %s", clientIP, domain, qtype)
             
 			// Renvoyer SERVFAIL immédiatement
@@ -1024,7 +1243,16 @@ func handleTCPConn(conn net.Conn) {
 				qtype = "OTHER"
 			}
 
-			if isRateLimited(clientIP, domain, qtype) {
+			blocked, level := checkRateLimit(clientIP, domain, qtype)
+			
+			if blocked {
+				if level == "banned" {
+					banIPWithIptables(clientIP, 24 * time.Hour)
+					// silent drop
+					return
+				}
+
+//			if isRateLimited(clientIP, domain, qtype) {
 				resp := new(dns.Msg)
 				resp.SetRcode(req, dns.RcodeServerFailure)
         
@@ -1263,12 +1491,24 @@ func main() {
 
 	flag.IntVar(&rateLimitWindowSec, "rate-limit-window", 60, "Rate limit window in seconds")
 	flag.IntVar(&rateLimitMaxQueries, "rate-limit-max", 50, "Max queries per IP/domain/type in window")
+
+	flag.StringVar(&banStateFile, "ban-state-file", "/var/lib/dns-lb/bans.json", "File path to persist ban states across restarts")
+
 	flag.Parse()
     
 	rateLimitWindow = time.Duration(rateLimitWindowSec) * time.Second
 	rateLimitThreshold = uint64(rateLimitMaxQueries)
 
-	flag.Parse()
+	if banStateFile != "" {
+		loadBanState(banStateFile)
+
+		go func() {
+			ticker := time.NewTicker(60 * time.Second)
+			for range ticker.C {
+				saveBanState(banStateFile)
+			}
+		}()
+	}
 
 
 	// 📝 Dual logging : terminal/journald + fichier
@@ -1363,10 +1603,18 @@ func main() {
 			// 📥 Dump à la demande (ne quitte pas)
 			log.Println("📥 Received SIGUSR1, triggering client stats dump...")
 			dumpClientStats()
+			if banStateFile != "" {
+				saveBanState(banStateFile)
+			}
 
 		case syscall.SIGINT, syscall.SIGTERM:
 			// 🛑 Arrêt gracieux
 			log.Printf("🛑 Received %s, initiating graceful shutdown...", sig)
+
+			if banStateFile != "" {
+				log.Println("🛑 Shutdown signal received. Saving ban state...")
+				saveBanState(banStateFile)
+			}
 
 			// 1. Annuler le contexte → arrête les listeners UDP/TCP et healthcheck
 			cancel()
