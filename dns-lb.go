@@ -117,7 +117,7 @@ var (
 	// zombie check
 	zombieCheckDomain string
 
-	appVersion = "260605-zombie"
+	appVersion = "260616-ratelimit"
 
 	// Prometheus authentication
 	metricsUser string
