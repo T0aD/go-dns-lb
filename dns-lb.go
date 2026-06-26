@@ -406,8 +406,35 @@ func cleanupRateLimitsOLD() {
 
 
 
-// firewall ban!
+func initIptablesBan(duration time.Duration) {
+	cmd := exec.Command("ipset", "create", "dns-lb-bans", "hash:ip", "family", "inet", "hashsize", "16384", "maxelem", "16840", "counters", "timeout", fmt.Sprintf("%0.f", duration.Seconds()))
+	log.Printf(cmd.String())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("❌ Warning: couldn't create ipset (err: %v) %s", err, string(out))
+	}
+
+	cmd = exec.Command("iptables", "-I", "INPUT", "-m", "set", "--match-set", "dns-lb-bans", "src", "-j", "DROP")
+	log.Printf(cmd.String())
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("❌ Warning: couldn't create iptables rules (err: %v) %s", err, string(out))
+	}
+}
+
 func banIPWithIptables(ip string, duration time.Duration) {
+	cmd := exec.Command("ipset", "-exist", "add", "dns-lb-bans", ip, "timeout", fmt.Sprintf("%.0f", duration.Seconds()))
+
+	log.Printf(cmd.String())
+	
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("❌ Failed to ban IP %s: (err: %v) %s", ip, err, string(out))
+	}
+}
+
+// firewall ban!
+func banIPWithIptablesOLD(ip string, duration time.Duration) {
 	// Exécuter : iptables -I INPUT -s <ip> -j DROP
 	cmd := exec.Command("iptables", "-I", "INPUT", "-s", ip, "-m", "comment", "--comment", "banned by dns-lb rate limitor", "-j", "DROP")
 
@@ -1549,7 +1576,9 @@ func main() {
 		initDnsProbe(zombieCheckDomain)
 	} else {
 		initDnsProbe("example.com")
-	}	
+	}
+
+	initIptablesBan(24 * time.Hour)
 
 	listenAddr := fmt.Sprintf(":%d", port)
 	log.Printf("Starting DNS UDP LB on %s, backends: %v", listenAddr, backends)
