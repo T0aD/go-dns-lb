@@ -1508,7 +1508,7 @@ func main() {
 
 	flag.BoolVar(&enablePositiveCache, "cache-positive", false, "Enable positive DNS cache")
 	flag.BoolVar(&enableNegativeCache, "cache-negative", false, "Enable negative DNS cache (errors)")
-	flag.DurationVar(&positiveCacheTTL, "cache-positive-ttl", 1*time.Hour, "TTL for positive cache (e.g., 1h, 30m, 60s)")
+	flag.DurationVar(&positiveCacheTTL, "cache-positive-ttl", 24*time.Hour, "TTL for positive cache (e.g., 1h, 30m, 60s)")
 	flag.DurationVar(&negativeCacheTTL, "cache-negative-ttl", 60*time.Second, "TTL for negative cache (e.g., 1h, 30m, 60s)")
 
 	flag.StringVar(&zombieCheckDomain, "zombie-check-domain", "", "Domain to use for zombie check. If a response asking for this record is empty, then backend is marked as unhealthy")
@@ -1516,8 +1516,8 @@ func main() {
 	flag.StringVar(&metricsUser, "metrics-user", "", "Username for Prometheus exporter")
 	flag.StringVar(&metricsPass, "metrics-pass", "", "Password for Prometheus exporter")
 
-	flag.IntVar(&rateLimitWindowSec, "rate-limit-window", 60, "Rate limit window in seconds")
-	flag.IntVar(&rateLimitMaxQueries, "rate-limit-max", 50, "Max queries per IP/domain/type in window")
+	flag.IntVar(&rateLimitWindowSec, "rate-limit-window", 120, "Rate limit window in seconds")
+	flag.IntVar(&rateLimitMaxQueries, "rate-limit-max", 30, "Max queries per IP/domain/type in window")
 
 	flag.StringVar(&banStateFile, "ban-state-file", "/var/lib/dns-lb/bans.json", "File path to persist ban states across restarts")
 
